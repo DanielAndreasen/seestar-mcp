@@ -7,8 +7,9 @@ Status: **v1 Tools in progress** — uv-managed Python 3.14 project (src layout,
 path dependency on the sibling `seestar-controller` repo, FastMCP from the
 MCP Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
 Implemented so far: the read-only Link Tools `connect` / `status`, the Job
-plumbing Tools `job_status` / `job_result`, and the scope-mutating Tools
-`goto` / `park` / `capture`.
+plumbing Tools `job_status` / `job_result`, the scope-mutating Tools
+`goto` / `park` / `capture`, and the compute Tools `solve_field` /
+`photometry_run`.
 
 ## Link Tools (`connect`, `status`)
 
@@ -66,6 +67,50 @@ refusal always runs (no redis); goto/park/capture against `link.mock_scope`
 with a real scope-queue worker and a tmp `SEESTAR_PROJECT_ROOT` run when
 Redis is reachable (CI), including a test that two concurrent scope Jobs
 never overlap on the Link.
+
+## Compute Tools (`solve_field`, `photometry_run`)
+
+The compute Tools submit **Jobs on the Compute queue** (`compute`, the default
+queue — ADR-0004; parallel consumers) instead of blocking the Tool call. The
+worker tasks live under `seestar_mcp.jobs.compute.*`
+(`src/seestar_mcp/jobs/compute.py`) and wrap seestar-controller's pure layers
+(plate solving, photometry) over frames already stored in a Project; the
+Tools live in `src/seestar_mcp/tools/compute.py`. Like every Job Tool they
+take a client-chosen `idempotency_key` (== Celery task id, claimed in Redis
+before sending) and return it; poll with `job_status` / `job_result`. Jobs
+carry `project_root` in their kwargs, so any compute worker can run them.
+`job_result` returns a small JSON-serializable summary (paths + key numbers) —
+raw FITS stay on disk in the Project.
+
+- `solve_field(idempotency_key, project?, session?, frame_id?, fits_path?,
+  solver?, center_hint?, pixel_scale_hint?, gaia_catalog?, ...)` — solves one
+  frame. Pass either a frame in a Project (`project` + `frame_id`, optionally
+  scoped by `session` — the WCS is persisted via the project's `frame_wcs`
+  store and written into the stored FITS header) or a plain `fits_path`
+  (solved in place, nothing persisted). `solver` is one of
+  seestar-controller's solvers (`auto`, `solve-field`, `gaia`; default
+  `auto`); `center_hint` / `pixel_scale_hint` steer the solve, and
+  `gaia_catalog` points at an offline JSON catalog file the worker can read
+  (used by tests / air-gapped setups instead of the network Gaia query).
+  `job_result` carries the WCS solution: solver, center RA/Dec, RMS, star
+  count, WCS cards, and the frame path.
+- `photometry_run(idempotency_key, project, session, picks?, aperture?,
+  excluded_frames?)` — runs the photometry `RunController` over the
+  session's sub-frames and stores one Measurement per frame in the Project
+  (`aperture` = `{radius_px, sky_in_px, sky_out_px}`; `picks` = target +
+  comp(/check) star picks `{role, label, x, y}` — saved as the project's
+  star picks when given, otherwise the previously stored picks are used).
+  `job_result` summarizes the run (measured / skipped / excluded frame ids,
+  measurements with mag + mag_err) and `job_result` picks them up from the
+  Project's lightcurve.
+
+`tests/test_compute_tools.py`: registration + queue-routing + submission
+(idempotency key as task id, `queue="compute"`) and argument validation run
+everywhere; the end-to-end Jobs (synthetic FITS frame solved against an
+offline Gaia catalog -> `frame_wcs` row + FITS header; a 3-frame session ->
+Measurements in the project db) run over real MCP stdio with a compute-queue
+worker when Redis is reachable (CI), and never touch the network or the
+`solve-field` binary.
 
 ## General idea
 
