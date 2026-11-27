@@ -6,8 +6,9 @@ telescope as tools for LLM agents.
 Status: **v1 Tools in progress** — uv-managed Python 3.14 project (src layout,
 path dependency on the sibling `seestar-controller` repo, FastMCP from the
 MCP Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
-Implemented so far: the read-only Link Tools `connect` / `status` and the Job
-plumbing Tools `job_status` / `job_result`.
+Implemented so far: the read-only Link Tools `connect` / `status`, the Job
+plumbing Tools `job_status` / `job_result`, and the scope-mutating Tools
+`goto` / `park` / `capture`.
 
 ## Link Tools (`connect`, `status`)
 
@@ -30,6 +31,41 @@ The scope address defaults to `SEESTAR_MCP_SCOPE_IP` (default
 (`SEESTAR_KEY_PATH` or `~/.config/seestar-controller/key.pem`). Tests drive
 both Tools over real MCP stdio against `link.mock_scope` on ephemeral ports
 (`tests/test_link_tools.py`) — no redis, no hardware.
+
+## Scope Tools (`goto`, `park`, `capture`)
+
+The scope-mutating Tools submit **Jobs on the Scope queue** (`scope`, exactly
+one consumer — ADR-0004) instead of blocking the Tool call; each Job opens a
+**short-lived per-job Link** inside the worker (connect, operate, disconnect).
+Every Tool takes a client-chosen `idempotency_key` and returns it; poll with
+`job_status` / `job_result`:
+
+- `goto(idempotency_key, target?, ra?, dec?, ip?, timeout?)` — slews the Scope
+  to a target. `target` is a catalog name (e.g. `"M13"`, resolved to J2000
+  RA/Dec via seestar-controller's SIMBAD catalog, cached + offline-graceful),
+  or pass explicit `ra` (hours) / `dec` (degrees) — never both. The worker
+  task issues `Device.goto` and waits for arrival.
+- `park(idempotency_key, ip?)` — parks the Scope (same kind of Job).
+- `capture(idempotency_key, frames?, exposure?, gain?, project?, ip?, timeout?)`
+  — stacks `frames` sub-frames at the current pointing, downloads them via
+  `link.frames` and stores the FITS in the Project (`project`, default
+  `seestar-mcp`, under `SEESTAR_PROJECT_ROOT`) under the open session;
+  `job_result` lists the stored frame ids/paths.
+
+**Slew gate (ADR-0003)**: `goto` and `park` raise a clear error unless the
+server was started with `SEESTAR_MCP_ALLOW_SLEW=1` (read once at server
+start). `capture` is not gated — capturing at the current pointing is
+harmless. The scope address resolves like the Link Tools (`ip` > pinned >
+`SEESTAR_MCP_SCOPE_IP`) and is passed to the worker in the Job kwargs.
+
+The worker-side tasks live under `seestar_mcp.jobs.scope.*`
+(`src/seestar_mcp/jobs/scope.py`), so the existing task route sends them to
+the Scope queue; `src/seestar_mcp/tools/scope.py` holds the Tools.
+`tests/test_scope_tools.py` drives them over real MCP stdio: the Slew-gate
+refusal always runs (no redis); goto/park/capture against `link.mock_scope`
+with a real scope-queue worker and a tmp `SEESTAR_PROJECT_ROOT` run when
+Redis is reachable (CI), including a test that two concurrent scope Jobs
+never overlap on the Link.
 
 ## General idea
 
