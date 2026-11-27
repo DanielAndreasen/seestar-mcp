@@ -1,10 +1,16 @@
-"""Shared test fixtures: real-Redis gating and a real Celery worker subprocess.
+"""Shared test fixtures: real-Redis gating, a real Celery worker subprocess,
+and an in-process mock Scope for the Link Tools.
 
 Round-trip tests use a REAL Celery worker started as a subprocess (solo pool,
 consuming the Compute queue) against the real Redis at ``REDIS_URL``. They
 are SKIPPED when Redis is unreachable (e.g. a local run without redis), so
 local runs stay green; in CI the redis service container sets REDIS_URL and
 the round-trip runs for real (spec testing decisions).
+
+The Link Tools tests (issue #6) instead run ``link.mock_scope`` IN THIS
+process on ephemeral ports and drive the MCP server (spawned as a stdio
+subprocess, like the job-tool tests) against it — no redis, no hardware, so
+they always run.
 """
 
 import os
@@ -14,11 +20,19 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
+from seestar_controller.link import auth
+from seestar_controller.link.mock_scope import MockScope
 
 from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE, REDIS_URL
+
+# Keep the test suite hermetic: the Link's protocol log is ON by default (it
+# writes under ~/.config/seestar-controller), so disable it for the whole
+# session (spawned MCP-server subprocesses inherit this).
+os.environ["SEESTAR_PROTOCOL_LOG"] = "0"
 
 
 def redis_reachable() -> bool:
@@ -101,3 +115,40 @@ def celery_worker() -> Iterator[subprocess.Popen[str]]:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+
+
+# --- mock Scope fixtures for the Link Tools (issue #6) ------------------------
+
+
+@pytest.fixture()
+def keypair() -> tuple[bytes, bytes]:
+    """A generated RSA test keypair: ``(private_pem, public_pem)``.
+
+    Stands in for the interop PEM extracted from the official app: the mock
+    Scope verifies the client's PEM-signed handshake against ``public_pem``,
+    and the MCP server under test signs with ``private_pem`` (via
+    ``SEESTAR_KEY_PATH``).
+    """
+    return auth.generate_keypair()
+
+
+@pytest.fixture()
+def mock_scope(keypair: tuple[bytes, bytes]) -> Iterator[MockScope]:
+    """A running mock Scope on ephemeral ports, verifying signed handshakes."""
+    _private_pem, public_pem = keypair
+    scope = MockScope(
+        "127.0.0.1", 0, 0, 0, public_pem=public_pem, frame_interval=0.01
+    )
+    scope.start()
+    yield scope
+    scope.stop()
+
+
+@pytest.fixture()
+def scope_key_path(tmp_path: Path, keypair: tuple[bytes, bytes]) -> Path:
+    """The keypair's private key written to a 0600 file, for SEESTAR_KEY_PATH."""
+    private_pem, _public_pem = keypair
+    path = tmp_path / "key.pem"
+    path.write_bytes(private_pem)
+    path.chmod(0o600)
+    return path

@@ -12,8 +12,9 @@ from seestar_mcp.tools import register_all
 
 mcp = FastMCP("seestar-mcp")
 
-# Tool groups (spec "Modules": one module per Tool group). Job plumbing
-# first: job_status / job_result (issue #5); scope Tools come in later tickets.
+# Tool groups (spec "Modules": one module per Tool group): the read-only Link
+# Tools connect / status (issue #6) and the Job plumbing job_status /
+# job_result (issue #5); scope-moving Tools come in later tickets.
 register_all(mcp)
 
 
