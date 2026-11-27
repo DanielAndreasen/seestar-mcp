@@ -13,13 +13,16 @@ subprocess, like the job-tool tests) against it — no redis, no hardware, so
 they always run.
 """
 
+import fcntl
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,7 +30,7 @@ import pytest
 from seestar_controller.link import auth
 from seestar_controller.link.mock_scope import MockScope
 
-from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE, REDIS_URL
+from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE, REDIS_URL, SCOPE_QUEUE
 
 # Keep the test suite hermetic: the Link's protocol log is ON by default (it
 # writes under ~/.config/seestar-controller), so disable it for the whole
@@ -54,20 +57,25 @@ requires_redis = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(scope="module")
-def celery_worker() -> Iterator[subprocess.Popen[str]]:
-    """Start a real Celery worker subprocess consuming the Compute queue.
+@contextmanager
+def _spawn_worker(
+    queue: str, extra_env: dict[str, str] | None = None
+) -> Generator[subprocess.Popen[str]]:
+    """Start a real Celery worker subprocess consuming ``queue`` and stop it.
 
-    ``--pool=solo`` keeps it to one process; ``-Q compute`` mirrors how the
-    demo Jobs are routed (the Compute queue is the default queue). Only used
-    by tests already skipped when Redis is unreachable; the guard below is
-    a second line of defense.
+    ``--pool=solo`` keeps it to one process — for the Scope queue that is
+    exactly the single consumer ADR-0004 requires. The worker inherits the
+    test process environment plus ``REDIS_URL`` and ``extra_env``. Only used
+    by tests already skipped when Redis is unreachable; the guard in the
+    fixtures is a second line of defense.
     """
     if not redis_reachable():
         pytest.skip(f"Redis at {REDIS_URL} unreachable")
     env = os.environ.copy()
     env["REDIS_URL"] = REDIS_URL
+    env["SEESTAR_PROTOCOL_LOG"] = "0"
     env.setdefault("C_FORCE_ROOT", "1")  # harmless when not root
+    env.update(extra_env or {})
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -78,9 +86,9 @@ def celery_worker() -> Iterator[subprocess.Popen[str]]:
             "worker",
             "--pool=solo",
             "-Q",
-            COMPUTE_QUEUE,
+            queue,
             "-n",
-            f"test-{COMPUTE_QUEUE}@%h",
+            f"test-{queue}@%h",
             "--loglevel=INFO",
         ],
         stdout=subprocess.PIPE,
@@ -107,14 +115,71 @@ def celery_worker() -> Iterator[subprocess.Popen[str]]:
         proc.kill()
         pytest.fail("celery worker did not become ready:\n" + "".join(lines))
 
-    yield proc
-
-    proc.terminate()
     try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+@pytest.fixture(scope="module")
+def celery_worker() -> Iterator[subprocess.Popen[str]]:
+    """Start a real Celery worker subprocess consuming the Compute queue.
+
+    ``--pool=solo`` keeps it to one process; ``-Q compute`` mirrors how the
+    demo Jobs are routed (the Compute queue is the default queue).
+    """
+    with _spawn_worker(COMPUTE_QUEUE) as proc:
+        yield proc
+
+
+@contextmanager
+def _single_scope_consumer() -> Generator[None]:
+    """Cross-process lock keeping exactly one Scope-queue worker alive.
+
+    All tests share the one Redis (db 0) and the Scope queue, so under
+    ``pytest -n auto`` several tests would otherwise run scope workers at
+    once — and one test's worker could pick up another test's scope Job and
+    execute it with the wrong ``SEESTAR_KEY_PATH`` / ``SEESTAR_PROJECT_ROOT``
+    (handshake "bad signature", frames stored into the wrong Project). The
+    lock serializes the scope-worker tests, mirroring ADR-0004's "exactly
+    one consumer" in the test setup itself.
+    """
+    lock_path = Path(tempfile.gettempdir()) / "seestar-mcp-test-scope-consumer.lock"
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@pytest.fixture()
+def scope_worker(
+    scope_key_path: Path, tmp_path: Path
+) -> Generator[subprocess.Popen[str]]:
+    """A real Celery worker subprocess consuming the Scope queue (issue #7).
+
+    Mirrors production (ADR-0004): the Scope queue has exactly one consumer
+    (``--pool=solo`` here, ``--concurrency=1`` in ``seestar_mcp.worker``).
+    The worker gets the test keypair (``SEESTAR_KEY_PATH`` — the mock Scope
+    verifies the signed handshake of the per-job Links) and a tmp
+    ``SEESTAR_PROJECT_ROOT`` so capture Jobs store into a tmp Project.
+    Held under :func:`_single_scope_consumer` so no other test's scope
+    worker can execute this test's Jobs (shared Redis under ``-n auto``).
+    """
+    with _single_scope_consumer(), _spawn_worker(
+        SCOPE_QUEUE,
+        {
+            "SEESTAR_KEY_PATH": str(scope_key_path),
+            "SEESTAR_PROJECT_ROOT": str(tmp_path / "projects"),
+        },
+    ) as proc:
+        yield proc
 
 
 # --- mock Scope fixtures for the Link Tools (issue #6) ------------------------

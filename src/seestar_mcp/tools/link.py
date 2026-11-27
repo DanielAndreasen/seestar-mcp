@@ -80,8 +80,13 @@ _pinned_lock = threading.Lock()
 _pinned: ScopeAddress | None = None
 
 
-def _resolve_address(ip: str | None) -> ScopeAddress:
-    """Per-call ``ip`` > address pinned by ``connect`` > ``SEESTAR_MCP_SCOPE_IP``."""
+def resolve_address(ip: str | None) -> ScopeAddress:
+    """Per-call ``ip`` > address pinned by ``connect`` > ``SEESTAR_MCP_SCOPE_IP``.
+
+    Shared by the Link Tools and the scope Tools (issue #7): the scope Jobs
+    resolve the address in the server process and pass it to the worker in
+    the Job kwargs.
+    """
     if ip:
         return _parse_address(ip)
     with _pinned_lock:
@@ -143,7 +148,7 @@ def register(mcp: FastMCP) -> None:
         ``reachable: false`` with an ``error`` when the Scope does not
         answer.
         """
-        address = _resolve_address(ip)
+        address = resolve_address(ip)
         _pin(address)
         try:
             device = _open_short_lived(address)
@@ -187,7 +192,7 @@ def register(mcp: FastMCP) -> None:
         and stacking progress. Raises a tool error when the Scope is
         unreachable.
         """
-        address = _resolve_address(ip)
+        address = resolve_address(ip)
         try:
             device = _open_short_lived(address)
         except Exception as exc:  # any Link failure is "unreachable" (re-raised below)
@@ -215,4 +220,4 @@ def register(mcp: FastMCP) -> None:
             device.disconnect()
 
 
-__all__ = ["register"]
+__all__ = ["ScopeAddress", "register", "resolve_address"]
