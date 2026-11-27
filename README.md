@@ -39,6 +39,24 @@ An agent can say "point at M13 and measure it" and the MCP server:
 - Docker / Docker Compose for redis + worker + MCP server
 - pytest, with seestar-controller's `mock_scope` for tests without hardware
 
+## Jobs and deployment (Celery + Redis)
+
+Long-running work is submitted as a **Job** to Celery with Redis as broker
+and result backend (`REDIS_URL`, default `redis://localhost:6379/0`; results
+expire after 24h). Two queues (ADR-0004):
+
+- **Scope queue** (`scope`) — Jobs that touch the Link; exactly one consumer.
+- **Compute queue** (`compute`) — Jobs on already-downloaded frames; parallel
+  consumers, and the default queue.
+
+`docker compose up` starts only `redis` + `worker` (ADR-0002); the worker
+image is built from the repo's parent directory so it can copy both
+`seestar-controller` and `seestar-mcp`. The worker entrypoint
+(`python -m seestar_mcp.worker`) runs two Celery workers in one container:
+`-Q scope --concurrency=1` and `-Q compute`. The MCP server itself runs on
+the host via `uv run` over stdio. `tests/test_jobs.py` round-trips a demo
+`echo` Job through real Redis (skipped locally when Redis is unreachable).
+
 ## Open questions
 
 - Import seestar-controller as a library vs. subprocess its CLI — decide when

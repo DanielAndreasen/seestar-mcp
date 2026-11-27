@@ -1,0 +1,11 @@
+# Per-Dockerfile ignore file (BuildKit): read from the build context root as
+# <path/to/Dockerfile>.dockerignore, i.e. ../seestar-mcp/Dockerfile.dockerignore
+# when the context is the parent directory. Keeps local junk (venvs, git
+# metadata) out of the worker image build context.
+**/.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
