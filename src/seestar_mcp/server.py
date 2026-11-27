@@ -14,8 +14,9 @@ mcp = FastMCP("seestar-mcp")
 
 # Tool groups (spec "Modules": one module per Tool group): the read-only Link
 # Tools connect / status (issue #6), the Job plumbing job_status /
-# job_result (issue #5) and the scope-mutating Tools goto / park / capture
-# (issue #7, Slew-gated per ADR-0003).
+# job_result (issue #5), the scope-mutating Tools goto / park / capture
+# (issue #7, Slew-gated per ADR-0003) and the compute Tools solve_field /
+# photometry_run (issue #8, on the Compute queue per ADR-0004).
 register_all(mcp)
 
 

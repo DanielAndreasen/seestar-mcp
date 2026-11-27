@@ -6,11 +6,12 @@ app; :func:`register_all` wires every group into ``seestar_mcp.server``.
 
 from mcp.server.fastmcp import FastMCP
 
+from seestar_mcp.tools import compute as compute
 from seestar_mcp.tools import jobs as jobs
 from seestar_mcp.tools import link as link
 from seestar_mcp.tools import scope as scope
 
-__all__ = ["jobs", "link", "register_all", "scope"]
+__all__ = ["compute", "jobs", "link", "register_all", "scope"]
 
 
 def register_all(mcp: FastMCP) -> None:
@@ -18,3 +19,4 @@ def register_all(mcp: FastMCP) -> None:
     link.register(mcp)
     jobs.register(mcp)
     scope.register(mcp)
+    compute.register(mcp)
