@@ -3,10 +3,33 @@
 MCP (Model Context Protocol) server that exposes the Seestar S50 smart
 telescope as tools for LLM agents.
 
-Status: **scaffolded** — uv-managed Python 3.14 project (src layout, path
-dependency on the sibling `seestar-controller` repo, FastMCP from the MCP
-Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
-The MCP Tools themselves are not implemented yet.
+Status: **v1 Tools in progress** — uv-managed Python 3.14 project (src layout,
+path dependency on the sibling `seestar-controller` repo, FastMCP from the
+MCP Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
+Implemented so far: the read-only Link Tools `connect` / `status` and the Job
+plumbing Tools `job_status` / `job_result`.
+
+## Link Tools (`connect`, `status`)
+
+Read-only Tools over seestar-controller's `link` layer (ADR-0004: each Tool
+opens a short-lived Link connection and closes it again — the server never
+holds a connection to the Scope):
+
+- `connect(ip?)` — verifies the Scope is reachable (signed handshake) and
+  **pins the scope address** in server-side state for later Tools; returns
+  reachability plus basic identity (address, connection state, current mode
+  and target), or `reachable: false` with an error. `ip` is an optional
+  per-call override (`host` or `host:port`, default port 4700).
+- `status(ip?)` — reads the Scope's current state (connection state, mode,
+  current target RA/Dec + name, stacking progress) with no side effects;
+  raises a tool error when the Scope is unreachable.
+
+The scope address defaults to `SEESTAR_MCP_SCOPE_IP` (default
+`192.168.87.185`, the S50 in station mode) and is overridden per call on
+`connect`. The Link handshake key resolves as in seestar-controller
+(`SEESTAR_KEY_PATH` or `~/.config/seestar-controller/key.pem`). Tests drive
+both Tools over real MCP stdio against `link.mock_scope` on ephemeral ports
+(`tests/test_link_tools.py`) — no redis, no hardware.
 
 ## General idea
 
@@ -79,9 +102,4 @@ the host via `uv run` over stdio. `tests/test_jobs.py` round-trips a demo
 
 ## Open questions
 
-- Import seestar-controller as a library vs. subprocess its CLI — decide when
-  looking at its packaging.
-- Which tools to expose first: `connect`, `capture`, `solve_field`,
-  `photometry_run`, `job_status`.
-- Auth/safety: MCP server on LAN only; agents must not slew the scope
-  unsupervised.
+- Auth/safety beyond stdio-only + the slew gate (ADR-0002/0003).
