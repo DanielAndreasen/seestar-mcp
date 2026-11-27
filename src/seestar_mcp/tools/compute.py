@@ -47,7 +47,11 @@ from seestar_controller.store import project as store_project
 from seestar_controller.store.stars import ROLE_CHECK, ROLE_COMP, ROLE_TARGET, ROLES
 
 from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE
-from seestar_mcp.jobs.compute import PHOTOMETRY_RUN_TASK, SOLVE_FIELD_TASK
+from seestar_mcp.jobs.compute import (
+    HR_DIAGRAM_TASK,
+    PHOTOMETRY_RUN_TASK,
+    SOLVE_FIELD_TASK,
+)
 from seestar_mcp.jobs.submit import submit_job
 
 #: Aperture keys accepted in the ``aperture`` argument of ``photometry_run``.
@@ -320,6 +324,71 @@ def register(mcp: FastMCP) -> None:
                 "session": session,
                 "picks": len(picks) if picks is not None else None,
                 "excluded_frames": excluded_frames,
+            },
+        }
+
+    @mcp.tool()
+    def hr_diagram(
+        idempotency_key: str,
+        project: str,
+        frame_id: int,
+        session: str | None = None,
+        recompute: bool = False,
+        gaia_catalog: str | None = None,
+        age: float | None = None,
+        feh: float | None = None,
+        dist_mod: float | None = None,
+    ) -> dict[str, Any]:
+        """H-R / CMD diagram data of one project stack — a compute-queue Job.
+
+        Submits a Job on the Compute queue under the given ``idempotency_key``;
+        poll with ``job_status`` / ``job_result``. The worker uses the stack's
+        persisted Gaia cross-match table of ``project`` + ``frame_id`` (e.g.
+        stored by a previous ``solve_field``), or recomputes it
+        (``recompute=True`` or no stored table) — the frame must be
+        plate-solved then, and ``gaia_catalog`` (an offline JSON Gaia catalog)
+        replaces the network query. ``job_result`` returns the cross-match
+        counts, cluster membership, the CMD points (G vs BP-RP) and H-R
+        points (abs G vs BP-RP, parallax-SNR cut), plus the PARSEC isochrone
+        overlay when ``age`` / ``feh`` / ``dist_mod`` are ALL given (bundled
+        fallback grid when the fetch fails). ``session`` optionally scopes the
+        frame lookup. The Project root resolves via ``SEESTAR_PROJECT_ROOT``.
+        """
+        if not isinstance(frame_id, int) or isinstance(frame_id, bool):
+            raise TypeError(f"frame_id must be an int, got {frame_id!r}")
+        if (age is None) != (feh is None) or (age is None) != (dist_mod is None):
+            raise ValueError(
+                "the isochrone overlay needs age, feh AND dist_mod together "
+                f"(got age={age!r}, feh={feh!r}, dist_mod={dist_mod!r})"
+            )
+        root, slug = _resolve_project(project)
+        kwargs: dict[str, Any] = {
+            "project": project,
+            "project_root": str(root),
+            "frame_id": frame_id,
+            "recompute": bool(recompute),
+        }
+        if session is not None:
+            kwargs["session"] = session
+        if gaia_catalog is not None:
+            kwargs["gaia_catalog"] = gaia_catalog
+        if age is not None and feh is not None and dist_mod is not None:
+            kwargs["age"] = float(age)
+            kwargs["feh"] = float(feh)
+            kwargs["dist_mod"] = float(dist_mod)
+
+        key = submit_job(
+            idempotency_key, HR_DIAGRAM_TASK, kwargs=kwargs, queue=COMPUTE_QUEUE
+        )
+        return {
+            "idempotency_key": key,
+            "task": HR_DIAGRAM_TASK,
+            "queue": COMPUTE_QUEUE,
+            "hr_diagram": {
+                "project": slug,
+                "frame_id": frame_id,
+                "recompute": bool(recompute),
+                "overlay": age is not None,
             },
         }
 

@@ -2,7 +2,7 @@
 
 Natural-language prompts for an LLM agent with the `seestar-mcp` tools
 available (`connect`, `status`, `goto`, `park`, `capture`, `solve_field`,
-`photometry_run`, `job_status`, `job_result`). All prompts assume the
+`photometry_run`, `hr_diagram`, `job_status`, `job_result`). All prompts assume the
 worker + redis are running and the server was started with
 `SEESTAR_MCP_ALLOW_SLEW=1`. Every job takes an `idempotency_key`: reuse the
 same key to safely retry a submission, use a fresh key for each new job.
@@ -56,16 +56,19 @@ Use the seestar-mcp tools (worker + redis running, SEESTAR_MCP_ALLOW_SLEW=1).
 4. solve_field idempotency_key "ngc7789-solve-1", project "ngc7789",
    frame_id of the first captured frame. Poll to SUCCESS; report field
    center + RMS.
-5. Photometry per cluster star: pick ~10 bright, non-saturated stars in
-   the solved frame. For each star s (s = 1..10), submit photometry_run
-   idempotency_key "ngc7789-photo-{s}", project "ngc7789", the session
-   id, picks = {"role":"target", x, y} on star s plus 3 other cluster
-   stars as {"role":"comp", x, y} (photometry_run takes exactly one
-   target). Poll each to SUCCESS; collect each star's mean mag + mag_err.
-6. Print the cluster's color-magnitude data (mag vs star index; use two
-   sessions in different filters for a true color). The measurements are
-   stored in the project db, so the HR diagram with isochrone fitting is
-   available in seestar-controller's GUI/CLI for this project.
+5. HR diagram directly: hr_diagram idempotency_key "ngc7789-hr-1",
+   project "ngc7789", frame_id of the first captured frame,
+   recompute=true (the frame is solved, so the Gaia cross-match can be
+   computed and stored), plus age/feh/dist_mod for the isochrone overlay
+   (e.g. age 9.0, feh 0.0, dist_mod 11.5 — NGC 7789's rough values).
+   Poll to SUCCESS; job_result returns the CMD points (G vs BP-RP), the
+   H-R points (abs G vs BP-RP) with cluster-membership flags, and the
+   isochrone overlay points. Print the member count and the diagram data.
+6. Optionally also run per-star photometry: for each of ~10 bright
+   cluster stars s, photometry_run idempotency_key "ngc7789-photo-{s}",
+   project "ngc7789", the session id, picks = {"role":"target", x, y} on
+   star s plus 3 other cluster stars as {"role":"comp", x, y}
+   (photometry_run takes exactly one target). Poll each to SUCCESS.
 7. park idempotency_key "ngc7789-park-1".
 ```
 

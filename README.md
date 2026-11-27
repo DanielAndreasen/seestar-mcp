@@ -9,7 +9,8 @@ MCP Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
 Implemented so far: the read-only Link Tools `connect` / `status`, the Job
 plumbing Tools `job_status` / `job_result`, the scope-mutating Tools
 `goto` / `park` / `capture`, and the compute Tools `solve_field` /
-`photometry_run`. Example agent prompts live in [`examples/prompts.md`](examples/prompts.md).
+`photometry_run` / `hr_diagram`. Example agent prompts live in
+[`examples/prompts.md`](examples/prompts.md).
 
 Related project: [`seestar-controller`](https://github.com/DanielAndreasen/seestar-controller) —
 the desktop controller whose `link` / `astrometry` / `photometry` / `analysis`
@@ -72,7 +73,7 @@ with a real scope-queue worker and a tmp `SEESTAR_PROJECT_ROOT` run when
 Redis is reachable (CI), including a test that two concurrent scope Jobs
 never overlap on the Link.
 
-## Compute Tools (`solve_field`, `photometry_run`)
+## Compute Tools (`solve_field`, `photometry_run`, `hr_diagram`)
 
 The compute Tools submit **Jobs on the Compute queue** (`compute`, the default
 queue — ADR-0004; parallel consumers) instead of blocking the Tool call. The
@@ -107,6 +108,14 @@ raw FITS stay on disk in the Project.
   `job_result` summarizes the run (measured / skipped / excluded frame ids,
   measurements with mag + mag_err) and `job_result` picks them up from the
   Project's lightcurve.
+- `hr_diagram(idempotency_key, project, frame_id, session?, recompute?,
+  gaia_catalog?, age?, feh?, dist_mod?)` — the H-R / CMD diagram data of one
+  project stack: uses its persisted Gaia cross-match table (or recomputes it
+  with `recompute=true` / an offline `gaia_catalog`; the frame must be
+  plate-solved then). `job_result` carries the cross-match counts, cluster
+  membership, the CMD points (G vs BP-RP), the H-R points (abs G vs BP-RP,
+  parallax-SNR cut) and, when `age`/`feh`/`dist_mod` are all given, the
+  PARSEC isochrone overlay.
 
 `tests/test_compute_tools.py`: registration + queue-routing + submission
 (idempotency key as task id, `queue="compute"`) and argument validation run

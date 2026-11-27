@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from seestar_controller.astrometry.session import (
+    prepare_project_frame,
     solve_project_frame,
     solve_session_frame,
 )
@@ -55,7 +56,15 @@ from seestar_controller.astrometry.solve import (
     SOLVER_AUTO,
     solve_fits_file,
 )
-from seestar_controller.gaia.query import GaiaStar
+from seestar_controller.gaia import matching as gaia_matching
+from seestar_controller.gaia import persistence as gaia_persistence
+from seestar_controller.gaia.detect import detect_sources, field_center_and_radius
+from seestar_controller.gaia.matching import (
+    DEFAULT_MATCH_RADIUS_ARCSEC as GAIA_MATCH_RADIUS_ARCSEC,
+)
+from seestar_controller.gaia.query import DEFAULT_G_LIMIT, GaiaStar
+from seestar_controller.hr_diagram import core as hr_core
+from seestar_controller.hr_diagram.isochrone import isochrone
 from seestar_controller.photometry.picking import ApertureParams
 from seestar_controller.photometry.run import RunController
 from seestar_controller.store import frames as store_frames
@@ -70,6 +79,7 @@ from seestar_mcp.jobs.tasks import JobTask
 #: scope route, so these go to the Compute queue (the default queue, ADR-0004).
 SOLVE_FIELD_TASK = "seestar_mcp.jobs.compute.solve_field"
 PHOTOMETRY_RUN_TASK = "seestar_mcp.jobs.compute.photometry_run"
+HR_DIAGRAM_TASK = "seestar_mcp.jobs.compute.hr_diagram"
 
 #: Keys of one ``picks`` entry accepted by the ``photometry_run`` Job (a
 #: JSON-serializable StarPick: aperture fields fall back to ``aperture``).
@@ -104,15 +114,13 @@ def _open_project(name: str, project_root: str | None) -> store_project.Project:
     return store_project.open_project(path)
 
 
-def _gaia_query_from_catalog(catalog_path: str | Path) -> Any:
-    """Build an offline ``gaia_query`` from a JSON catalog file.
+def _gaia_stars_from_catalog(catalog_path: str | Path) -> list[GaiaStar]:
+    """Load an offline Gaia catalog JSON file into :class:`GaiaStar` rows.
 
     The file holds a JSON list of Gaia reference stars, each a mapping with
     at least ``source_id``, ``ra_deg``, ``dec_deg`` (and optionally ``g``,
-    ``bp``, ``rp``, ... — the :class:`~seestar_controller.gaia.query.GaiaStar`
-    fields). The returned query answers any cone with the catalog's stars (the
-    cross-match filters by radius), so a solve can run with NO network access
-    — e.g. in CI or with a catalog exported from a previous online query.
+    ``bp``, ``rp``, ``parallax``, ... — the
+    :class:`~seestar_controller.gaia.query.GaiaStar` fields).
     """
     path = Path(catalog_path)
     try:
@@ -136,9 +144,25 @@ def _gaia_query_from_catalog(catalog_path: str | Path) -> Any:
                 source_id=int(row["source_id"]),
                 ra_deg=float(row["ra_deg"]),
                 dec_deg=float(row["dec_deg"]),
-                g=None if row.get("g") is None else float(row["g"]),
+                **{
+                    field: None if row.get(field) is None else float(row[field])
+                    for field in ("g", "bp", "rp", "parallax", "parallax_error",
+                                  "pmra", "pmra_error", "pmdec", "pmdec_error")
+                    if field in row
+                },
             )
         )
+    return stars
+
+
+def _gaia_query_from_catalog(catalog_path: str | Path) -> Any:
+    """Build an offline ``gaia_query`` from a JSON catalog file.
+
+    The returned query answers any cone with the catalog's stars (the
+    cross-match filters by radius), so a solve can run with NO network access
+    — e.g. in CI or with a catalog exported from a previous online query.
+    """
+    stars = _gaia_stars_from_catalog(catalog_path)
 
     def query(center_ra_deg: float, center_dec_deg: float, radius_deg: float) -> list[GaiaStar]:
         return stars
@@ -369,9 +393,140 @@ def photometry_run(
     }
 
 
+def _hr_point_payload(point: Any) -> dict[str, Any]:
+    """JSON-serializable form of one :class:`~.hr_diagram.core.HrPoint`."""
+    return {
+        "source_id": point.source_id,
+        "x": point.x,
+        "y": point.y,
+        "g": point.g,
+        "bp_rp": point.bp_rp,
+        "abs_g": point.abs_g,
+        "parallax": point.parallax,
+        "parallax_error": point.parallax_error,
+        "pmra": point.pmra,
+        "pmdec": point.pmdec,
+        "member": point.member,
+    }
+
+
+@app.task(name=HR_DIAGRAM_TASK, base=JobTask)
+def hr_diagram(
+    *,
+    project: str,
+    project_root: str | None = None,
+    frame_id: int,
+    session: str | None = None,
+    recompute: bool = False,
+    gaia_catalog: str | None = None,
+    match_radius_arcsec: float = GAIA_MATCH_RADIUS_ARCSEC,
+    g_limit: float = DEFAULT_G_LIMIT,
+    parallax_snr: float = hr_core.DEFAULT_PARALLAX_SNR,
+    age: float | None = None,
+    feh: float | None = None,
+    dist_mod: float | None = None,
+) -> dict[str, Any]:
+    """Compute Job: the H-R / CMD diagram data of one project stack.
+
+    Uses the stack's persisted Gaia cross-match table
+    (:func:`seestar_controller.gaia.persistence.load_crossmatch`) — e.g.
+    stored by a previous ``solve_field`` with the Gaia solver — or recomputes
+    it (``recompute=True`` or no stored table) via
+    :func:`seestar_controller.gaia.matching.crossmatch_stack` (detect sources,
+    Gaia cone search, cross-match; an offline ``gaia_catalog`` JSON replaces
+    the network query) and persists it. The frame must be plate-solved when
+    the cross-match is recomputed (its FITS header carries the WCS).
+
+    Returns JSON-serializable diagram data: cross-match counts, the cluster
+    :class:`~seestar_controller.hr_diagram.core.Membership`, the CMD points
+    (G vs BP-RP), the H-R points (abs G vs BP-RP, parallax-SNR cut) — each
+    point with its ``member`` flag — and, when ``age`` / ``feh`` /
+    ``dist_mod`` are ALL given, the PARSEC isochrone overlay (bundled
+    fallback grid when the network fetch fails).
+    """
+    if (age is None) != (feh is None) or (age is None) != (dist_mod is None):
+        raise ValueError(
+            "the isochrone overlay needs age, feh AND dist_mod together "
+            f"(got age={age!r}, feh={feh!r}, dist_mod={dist_mod!r})"
+        )
+    project_handle = _open_project(project, project_root)
+    try:
+        frame = next(
+            (
+                f
+                for f in store_frames.list_frames(project_handle)
+                if f.id == frame_id and (session is None or f.session_id == session)
+            ),
+            None,
+        )
+        if frame is None:
+            where = f"session {session!r} of " if session else ""
+            raise ValueError(
+                f"no frame id {frame_id} in {where}project {project!r}"
+            )
+        table = gaia_persistence.load_crossmatch(project_handle, frame_id)
+        recomputed = False
+        if recompute or not table:
+            _resolved, data, header = prepare_project_frame(project_handle, frame)
+            if gaia_catalog is not None:
+                sources = detect_sources(data, header)
+                _center, _radius_deg = field_center_and_radius(header, data.shape)
+                rows = gaia_matching.crossmatch(
+                    sources, _gaia_stars_from_catalog(gaia_catalog),
+                    radius_arcsec=match_radius_arcsec,
+                )
+            else:
+                rows = gaia_matching.crossmatch_stack(
+                    data, header, radius_arcsec=match_radius_arcsec, g_limit=g_limit
+                )
+            table = gaia_persistence.save_crossmatch(project_handle, frame_id, rows)
+            recomputed = True
+        membership = hr_core.membership_filter(table)
+        cmd = hr_core.cmd_points(table, membership)
+        hr = hr_core.hr_points(table, parallax_snr, membership)
+        overlay = None
+        if age is not None and feh is not None and dist_mod is not None:
+            overlay = isochrone(age, feh, dist_mod)
+        return {
+            "project": project_handle.slug,
+            "project_path": str(project_handle.path),
+            "frame_id": frame.id,
+            "session_id": frame.session_id,
+            "crossmatch": {
+                "recomputed": recomputed,
+                "rows": len(table),
+                "matched": sum(1 for row in table if row.matched),
+            },
+            "membership": {
+                "sample_size": membership.sample_size,
+                "n_members": len(membership.member_ids),
+                "parallax_median": membership.parallax_median,
+                "sigma_clip": membership.sigma_clip,
+            },
+            "cmd": [_hr_point_payload(p) for p in cmd],
+            "hr": [_hr_point_payload(p) for p in hr],
+            "overlay": (
+                None
+                if overlay is None
+                else [
+                    {"bp_rp": p.bp_rp, "abs_g": p.abs_g, "g": p.g} for p in overlay
+                ]
+            ),
+            "overlay_params": (
+                None
+                if overlay is None
+                else {"age": age, "feh": feh, "dist_mod": dist_mod}
+            ),
+        }
+    finally:
+        project_handle.close()
+
+
 __all__ = [
+    "HR_DIAGRAM_TASK",
     "PHOTOMETRY_RUN_TASK",
     "SOLVE_FIELD_TASK",
+    "hr_diagram",
     "photometry_run",
     "solve_field",
 ]

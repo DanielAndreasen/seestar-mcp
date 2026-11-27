@@ -58,7 +58,11 @@ from test_scope_tools import _job_result, _key, _poll_until_done
 from seestar_mcp.jobs import app
 from seestar_mcp.jobs import submit as submit_module
 from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE, REDIS_URL
-from seestar_mcp.jobs.compute import PHOTOMETRY_RUN_TASK, SOLVE_FIELD_TASK
+from seestar_mcp.jobs.compute import (
+    HR_DIAGRAM_TASK,
+    PHOTOMETRY_RUN_TASK,
+    SOLVE_FIELD_TASK,
+)
 from seestar_mcp.server import mcp
 
 # --- synthetic plate-solvable frame (mirrors test_astrometry_solve.py) --------
@@ -936,5 +940,183 @@ def test_photometry_run_job_stores_measurements_in_project(
         picks = store_stars.load_star_picks(project)
         assert [p.role for p in picks] == ["target", "comp", "comp", "comp"]
         assert picks[0].aperture_radius == 4.0
+    finally:
+        project.close()
+
+
+# --- hr_diagram Tool / Job ---------------------------------------------------------
+
+
+def _hr_gaia_catalog(path: Path) -> Path:
+    """Offline Gaia catalog with FULL fields (photometry + astrometry) at the
+    TRUE sky positions of the synthetic image stars — enough for CMD, H-R
+    points and the membership filter."""
+    wcs = _solve_true_wcs()
+    rows = []
+    for index, (cy, cx, _peak) in enumerate(SOLVE_STARS):
+        coord = wcs.pixel_to_world(cx, cy)
+        rows.append(
+            {
+                "source_id": 1000 + index,
+                "ra_deg": coord.ra.deg,
+                "dec_deg": coord.dec.deg,
+                "g": 12.0 + index * 0.3,
+                "bp": 12.5 + index * 0.3,
+                "rp": 11.5 + index * 0.3,
+                "parallax": 1.0,
+                "parallax_error": 0.1,
+                "pmra": 5.0,
+                "pmra_error": 0.2,
+                "pmdec": -3.0,
+                "pmdec_error": 0.2,
+            }
+        )
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return path
+
+
+def test_hr_diagram_tool_rejects_partial_overlay_params() -> None:
+    """age/feh/dist_mod must be given together; frame_id must be an int."""
+
+    async def run() -> None:
+        params = _server_params()
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            res = await session.call_tool(
+                "hr_diagram",
+                {
+                    "idempotency_key": _key("hr-bad"),
+                    "project": "whatever",
+                    "frame_id": 1,
+                    "age": 9.0,
+                },
+            )
+            assert res.isError
+            assert "age, feh AND dist_mod" in _error_text(res)
+            res = await session.call_tool(
+                "hr_diagram",
+                {
+                    "idempotency_key": _key("hr-bad2"),
+                    "project": "whatever",
+                    "frame_id": "1",
+                },
+            )
+            assert res.isError
+
+    asyncio.run(run())
+
+
+@requires_redis
+def test_hr_diagram_job_returns_cmd_hr_membership_and_overlay(
+    celery_worker: subprocess.Popen[str], tmp_path: Path
+) -> None:
+    """hr_diagram on a solved project stack: recomputes the cross-match from an
+    offline catalog, persists it, and returns CMD + H-R points + membership +
+    isochrone overlay; a second call reuses the stored table."""
+    project_root = tmp_path / "projects"
+    project = store_project.create_project("HR Proj", root=project_root)
+    try:
+        session_id = store_sessions.start_session(project, "2026-11-20T22:00:00")
+        header = dict(_solve_true_wcs().to_header())
+        header["DATE-OBS"] = "2026-11-20T22:00:00.000"
+        frame = store_frames.store_frame(
+            project, session_id, "stack", _fits_bytes(_solve_image(), header)
+        )
+        catalog = _hr_gaia_catalog(tmp_path / "gaia-catalog.json")
+        key = _key("hr")
+
+        async def run() -> Any:
+            params = _server_params({"SEESTAR_PROJECT_ROOT": str(project_root)})
+            async with (
+                stdio_client(params) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                res = await session.call_tool(
+                    "hr_diagram",
+                    {
+                        "idempotency_key": key,
+                        "project": "HR Proj",
+                        "frame_id": frame.id,
+                        "recompute": True,
+                        "gaia_catalog": str(catalog),
+                        "age": 9.0,
+                        "feh": 0.0,
+                        "dist_mod": 10.0,
+                    },
+                )
+                assert not res.isError
+                submitted = _payload(res)
+                assert submitted["idempotency_key"] == key
+                assert submitted["task"] == HR_DIAGRAM_TASK
+                assert submitted["queue"] == COMPUTE_QUEUE
+                assert submitted["hr_diagram"]["frame_id"] == frame.id
+                assert submitted["hr_diagram"]["overlay"] is True
+
+                status = await _poll_until_done(session, key, timeout_s=180.0)
+                assert status["state"] == "SUCCESS", status
+                assert status["error"] is None
+                return await _job_result(session, key)
+
+        result = asyncio.run(run())
+
+        assert result["project"] == "hr-proj"
+        assert result["frame_id"] == frame.id
+        assert result["session_id"] == session_id
+        assert result["crossmatch"]["recomputed"] is True
+        assert result["crossmatch"]["rows"] == len(SOLVE_STARS)
+        assert result["crossmatch"]["matched"] == len(SOLVE_STARS)
+        # all synthetic stars share parallax/pm -> membership sample sees them
+        assert result["membership"]["sample_size"] == len(SOLVE_STARS)
+        # CMD: every matched row with g/bp/rp; H-R: parallax SNR 1.0/0.1=10 > 5
+        assert len(result["cmd"]) == len(SOLVE_STARS)
+        assert len(result["hr"]) == len(SOLVE_STARS)
+        for point in result["hr"]:
+            assert point["abs_g"] is not None
+            assert point["bp_rp"] == pytest.approx(1.0)
+            assert point["member"] is True
+        # isochrone overlay served (bundled fallback grid when offline)
+        assert result["overlay"] is not None and len(result["overlay"]) > 0
+        assert result["overlay_params"] == {"age": 9.0, "feh": 0.0, "dist_mod": 10.0}
+        for point in result["overlay"]:
+            assert point["g"] == pytest.approx(point["abs_g"] + 10.0)
+
+        # the cross-match table was persisted in the project db
+        from seestar_controller.gaia import persistence as gaia_persistence
+
+        stored = gaia_persistence.load_crossmatch(project, frame.id)
+        assert len(stored) == len(SOLVE_STARS)
+
+        # a second job with recompute=False reuses the stored table
+        key2 = _key("hr2")
+
+        async def rerun() -> Any:
+            params = _server_params({"SEESTAR_PROJECT_ROOT": str(project_root)})
+            async with (
+                stdio_client(params) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                res = await session.call_tool(
+                    "hr_diagram",
+                    {
+                        "idempotency_key": key2,
+                        "project": "HR Proj",
+                        "frame_id": frame.id,
+                    },
+                )
+                assert not res.isError
+                status = await _poll_until_done(session, key2, timeout_s=60.0)
+                assert status["state"] == "SUCCESS", status
+                return await _job_result(session, key2)
+
+        again = asyncio.run(rerun())
+        assert again["crossmatch"]["recomputed"] is False
+        assert again["crossmatch"]["matched"] == len(SOLVE_STARS)
+        assert again["overlay"] is None
+        assert len(again["cmd"]) == len(SOLVE_STARS)
     finally:
         project.close()
