@@ -3,7 +3,10 @@
 MCP (Model Context Protocol) server that exposes the Seestar S50 smart
 telescope as tools for LLM agents.
 
-Status: **idea outline only** — no implementation yet.
+Status: **scaffolded** — uv-managed Python 3.14 project (src layout, path
+dependency on the sibling `seestar-controller` repo, FastMCP from the MCP
+Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
+The MCP Tools themselves are not implemented yet.
 
 ## General idea
 
