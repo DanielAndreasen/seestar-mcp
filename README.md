@@ -9,7 +9,11 @@ MCP Python SDK, celery + redis, pytest-xdist dev group, ty/ruff configured).
 Implemented so far: the read-only Link Tools `connect` / `status`, the Job
 plumbing Tools `job_status` / `job_result`, the scope-mutating Tools
 `goto` / `park` / `capture`, and the compute Tools `solve_field` /
-`photometry_run`.
+`photometry_run`. Example agent prompts live in [`examples/prompts.md`](examples/prompts.md).
+
+Related project: [`seestar-controller`](https://github.com/DanielAndreasen/seestar-controller) —
+the desktop controller whose `link` / `astrometry` / `photometry` / `analysis`
+modules this server wraps as MCP tools.
 
 ## Link Tools (`connect`, `status`)
 
