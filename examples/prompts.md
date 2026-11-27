@@ -44,21 +44,29 @@ SEESTAR_MCP_ALLOW_SLEW=1 is set, scope at 192.168.87.185.
 Each photometry run is cumulative over the whole session, so the agent
 diffs old vs new results to update the lightcurve incrementally.
 
-## 2. One-shot deep-sky object: point at M13 and measure it
+## 2. Open cluster: HR diagram of NGC 7789
 
 ```markdown
 Use the seestar-mcp tools (worker + redis running, SEESTAR_MCP_ALLOW_SLEW=1).
 1. connect, then status to confirm the scope is reachable.
-2. goto idempotency_key "m13-goto-1", target "M13". Poll job_status /
-   job_result until the slew completes.
-3. capture idempotency_key "m13-cap-1", project "m13", frames 20,
+2. goto idempotency_key "ngc7789-goto-1", target "NGC 7789". Poll
+   job_status / job_result until the slew completes.
+3. capture idempotency_key "ngc7789-cap-1", project "ngc7789", frames 30,
    exposure 10, gain 80. Poll to SUCCESS; note session id + frame ids.
-4. solve_field idempotency_key "m13-solve-1", project "m13", frame_id of
-   the first captured frame. Poll to SUCCESS; report field center + RMS.
-5. photometry_run idempotency_key "m13-photo-1", project "m13", session
-   id, picks = one target pick on a bright cluster star + 3 comp stars.
-   Poll to SUCCESS; print the measurement summary (jd, mag, mag_err).
-6. park idempotency_key "m13-park-1".
+4. solve_field idempotency_key "ngc7789-solve-1", project "ngc7789",
+   frame_id of the first captured frame. Poll to SUCCESS; report field
+   center + RMS.
+5. Photometry per cluster star: pick ~10 bright, non-saturated stars in
+   the solved frame. For each star s (s = 1..10), submit photometry_run
+   idempotency_key "ngc7789-photo-{s}", project "ngc7789", the session
+   id, picks = {"role":"target", x, y} on star s plus 3 other cluster
+   stars as {"role":"comp", x, y} (photometry_run takes exactly one
+   target). Poll each to SUCCESS; collect each star's mean mag + mag_err.
+6. Print the cluster's color-magnitude data (mag vs star index; use two
+   sessions in different filters for a true color). The measurements are
+   stored in the project db, so the HR diagram with isochrone fitting is
+   available in seestar-controller's GUI/CLI for this project.
+7. park idempotency_key "ngc7789-park-1".
 ```
 
 ## 3. Tracking quality: drift check over a series of frames
