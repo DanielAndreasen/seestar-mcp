@@ -1,0 +1,42 @@
+# ADR-0002: Docker Compose runs ONLY redis + worker — never the MCP server.
+# The MCP server runs on the host via `uv run` over stdio; only the broker
+# (redis) and the Celery workers are networked services.
+#
+# The worker image is built from the PARENT directory of this repo so the
+# build can COPY both sibling checkouts (ADR-0001 path dependency):
+#   <parent>/seestar-controller/   and   <parent>/seestar-mcp/
+# (clone the two repos side by side under their canonical names before
+# running `docker compose up`).
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Published so the host-side MCP server can submit and poll Jobs
+    # (REDIS_URL=redis://localhost:6379/0 on the host).
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # No volume: broker state is disposable (Job results expire after 24h).
+
+  worker:
+    build:
+      context: ..
+      dockerfile: seestar-mcp/Dockerfile
+    environment:
+      # Broker + result backend inside the compose network.
+      REDIS_URL: redis://redis:6379/0
+      # Optional: prefork processes for the Compute queue (default: cpu count).
+      # The Scope queue always runs at concurrency 1 (ADR-0004) — see
+      # src/seestar_mcp/worker.py, which starts one worker per queue.
+      # SEESTAR_MCP_WORKER_CONCURRENCY: "4"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Entrypoint: python -m seestar_mcp.worker — consumes BOTH queues with
+    # two celery workers in this one service: `-Q scope --concurrency=1`
+    # (exactly one consumer, ADR-0004) and `-Q compute` (parallel pool).
+    command: [".venv/bin/python", "-m", "seestar_mcp.worker"]
