@@ -1,0 +1,73 @@
+name: CI
+
+# Issue #3: uv-based CI, mirroring seestar-controller's workflow. Runs on
+# pushes and PRs to master. The redis service container gives the test suite
+# a real Redis (REDIS_URL), per the spec's testing decisions; the current
+# smoke tests do not require it yet.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping | grep PONG"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      # ADR-0001: seestar-controller is a path dependency on the sibling repo
+      # (../seestar-controller), so both checkouts must sit side by side in
+      # github.workspace for the path to resolve.
+      - name: Checkout seestar-mcp
+        uses: actions/checkout@v4
+        with:
+          path: seestar-mcp
+
+      - name: Checkout seestar-controller (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: DanielAndreasen/seestar-controller
+          path: seestar-controller
+
+      - name: Install uv (with cache)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        working-directory: seestar-mcp
+        run: uv sync --locked
+
+      - name: Check lockfile is up to date
+        working-directory: seestar-mcp
+        run: uv lock --check
+
+      - name: Type check (ty)
+        working-directory: seestar-mcp
+        run: uv tool run ty check
+
+      - name: Lint (ruff)
+        working-directory: seestar-mcp
+        run: uv tool run ruff check
+
+      - name: Test (pytest against the redis service)
+        working-directory: seestar-mcp
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: uv run pytest -q -n auto
