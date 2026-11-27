@@ -143,6 +143,11 @@ def test_connect_succeeds_against_mock_scope_and_pins_its_address(
             assert payload["verified"] is True  # PEM-signed handshake ok
             assert payload["mode"] == "idle"
             assert payload["target"] is None
+            # clock sync ran during connect (the mock answers unknown
+            # methods with a canned code 0, so time_synced=true here; on
+            # firmware without scope_set_time it degrades to false)
+            assert payload["time_synced"] is True
+            assert payload["clock_sync_error"] is None
 
             # connect pinned the address: status with no args uses it.
             res = await session.call_tool("status", {})

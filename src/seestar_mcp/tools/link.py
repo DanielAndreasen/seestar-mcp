@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -120,6 +121,30 @@ def _open_short_lived(address: ScopeAddress) -> Device:
     )
 
 
+def _sync_scope_clock(device: Device) -> dict[str, Any]:
+    """Sync the Scope's clock from the host clock (fw 9.75, live-probed).
+
+    A Scope whose clock is wrong (e.g. stuck at 2000-01-01 after losing
+    the app connection) computes target visibility for the wrong date and
+    refuses every ``scope_goto`` with code 207. The Seestar app syncs the
+    clock on connect; this does the same: ``scope_set_time`` with
+    ``[iso8601_utc, "+0"]``, then ``scope_get_time`` to report what the
+    Scope now believes. Never raises: firmware without these methods
+    (mock, older fw -> code 103) just yields ``time_synced: false``.
+    """
+    try:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        device.transport.request("scope_set_time", [now, "+0"])
+        scope_time = device.transport.request("scope_get_time")
+        return {"time_synced": True, "scope_time": scope_time, "clock_sync_error": None}
+    except Exception as exc:  # noqa: BLE001 - clock sync must not fail connect
+        return {
+            "time_synced": False,
+            "scope_time": None,
+            "clock_sync_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _target_payload(state: DeviceState) -> dict[str, Any] | None:
     """The current target as a JSON payload (RA/Dec in hours/degrees + name)."""
     if state.target is None:
@@ -137,14 +162,17 @@ def register(mcp: FastMCP) -> None:
         Opens a short-lived Link connection to the scope address — the ``ip``
         argument (``host`` or ``host:port``), else the address pinned by a
         previous ``connect``, else ``SEESTAR_MCP_SCOPE_IP`` (default
-        192.168.87.185) — reads basic identity, and closes the connection
-        again (ADR-0004: the server never holds a connection to the Scope).
+        192.168.87.185) — syncs the Scope's clock from the host (a Scope
+        with a wrong clock refuses every goto with code 207), reads basic
+        identity, and closes the connection again (ADR-0004: the server
+        never holds a connection to the Scope).
 
         The address this call used is pinned as the server-side default for
         later Tools (``status``, and the scope Jobs of later tickets), even
         when the Scope turns out to be unreachable. Returns ``reachable``
         plus identity on success (address, connection state, signed-
-        handshake ``verified``, current mode and target), or
+        handshake ``verified``, current mode and target, and the clock-
+        sync result ``time_synced`` / ``scope_time``), or
         ``reachable: false`` with an ``error`` when the Scope does not
         answer.
         """
@@ -167,6 +195,7 @@ def register(mcp: FastMCP) -> None:
                 "verified": device.transport.verified,
                 "mode": state.mode,
                 "target": _target_payload(state),
+                **_sync_scope_clock(device),
             }
         except Exception as exc:  # noqa: BLE001 - report, don't crash the Tool
             return {

@@ -1,6 +1,8 @@
-# ADR-0002: Docker Compose runs ONLY redis + worker — never the MCP server.
-# The MCP server runs on the host via `uv run` over stdio; only the broker
-# (redis) and the Celery workers are networked services.
+# ADR-0002: Docker Compose runs ONLY the worker — never the MCP server.
+# The MCP server runs on the host via `uv run` over stdio. The broker
+# (Redis) is expected on the HOST at localhost:6379 (e.g. a system
+# redis-server); the worker reaches it via host.docker.internal so both
+# sides share ONE broker (REDIS_URL=redis://localhost:6379/0 on the host).
 #
 # The worker image is built from the PARENT directory of this repo so the
 # build can COPY both sibling checkouts (ADR-0001 path dependency):
@@ -9,33 +11,27 @@
 # running `docker compose up`).
 
 services:
-  redis:
-    image: redis:7-alpine
-    # Published so the host-side MCP server can submit and poll Jobs
-    # (REDIS_URL=redis://localhost:6379/0 on the host).
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    # No volume: broker state is disposable (Job results expire after 24h).
-
   worker:
     build:
       context: ..
       dockerfile: seestar-mcp/Dockerfile
+    # Host networking: the broker is the host's redis-server bound to
+    # 127.0.0.1:6379, unreachable via host.docker.internal from a
+    # container. With host networking, localhost:6379 in the container
+    # IS the host's redis — same instance the MCP server uses.
+    network_mode: host
     environment:
-      # Broker + result backend inside the compose network.
-      REDIS_URL: redis://redis:6379/0
+      # Broker + result backend on the host — same instance the host-side
+      # MCP server uses via REDIS_URL=redis://localhost:6379/0.
+      REDIS_URL: redis://localhost:6379/0
+      # Scope interop key, mounted read-only below (host path by default).
+      SEESTAR_KEY_PATH: /run/seestar/key.pem
+    volumes:
+      - ${HOME}/.config/seestar-controller/key.pem:/run/seestar/key.pem:ro
       # Optional: prefork processes for the Compute queue (default: cpu count).
       # The Scope queue always runs at concurrency 1 (ADR-0004) — see
       # src/seestar_mcp/worker.py, which starts one worker per queue.
       # SEESTAR_MCP_WORKER_CONCURRENCY: "4"
-    depends_on:
-      redis:
-        condition: service_healthy
     # Entrypoint: python -m seestar_mcp.worker — consumes BOTH queues with
     # two celery workers in this one service: `-Q scope --concurrency=1`
     # (exactly one consumer, ADR-0004) and `-Q compute` (parallel pool).
