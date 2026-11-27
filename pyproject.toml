@@ -1,0 +1,48 @@
+[project]
+name = "seestar-mcp"
+version = "0.1.0"
+description = "MCP server that exposes the Seestar S50 smart telescope as tools for LLM agents"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "celery>=5.7.0",
+    "mcp>=1.30.0,<2",
+    "redis>=8.2.0",
+    "seestar-controller",
+]
+
+[project.scripts]
+seestar-mcp = "seestar_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/seestar_mcp"]
+
+[tool.uv.sources]
+# ADR-0001: seestar-controller is imported as a library, via a path dependency
+# on the sibling repo. The two repos must live side by side for installs and
+# Docker builds (CI checks them out as siblings; in dev worktrees a
+# `seestar-controller` symlink next to the worktree makes ../ resolve).
+seestar-controller = { path = "../seestar-controller" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-xdist>=3.8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+src = ["src"]
+target-version = "py314"
+
+[tool.ty.environment]
+# Pin the interpreter ty resolves imports against: the project venv, Python 3.14.
+python = ".venv"
+python-version = "3.14"
