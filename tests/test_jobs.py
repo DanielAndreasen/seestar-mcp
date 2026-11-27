@@ -9,44 +9,21 @@ Two kinds of tests:
   are SKIPPED when Redis is unreachable (e.g. a local run without redis), so
   local runs stay green; in CI the redis service container sets REDIS_URL
   and the round-trip runs for real.
+
+The skip pattern (``requires_redis``) and the ``celery_worker`` fixture live
+in ``tests/conftest.py`` and are shared with the Job plumbing Tool tests.
 """
 
 import os
-import socket
 import subprocess
-import sys
-import threading
-import time
 import uuid
-from collections.abc import Iterator
-from urllib.parse import urlparse
 
-import pytest
 from celery.result import AsyncResult
+from conftest import requires_redis
 
 from seestar_mcp.jobs import app
 from seestar_mcp.jobs.celery_app import COMPUTE_QUEUE, REDIS_URL, SCOPE_QUEUE
 from seestar_mcp.jobs.tasks import echo
-
-
-def _redis_reachable() -> bool:
-    """Socket-connect check against the REDIS_URL host:port (no redis client)."""
-    parsed = urlparse(REDIS_URL)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 6379
-    try:
-        with socket.create_connection((host, port), timeout=1.0):
-            return True
-    except OSError:
-        return False
-
-
-requires_redis = pytest.mark.skipif(
-    not _redis_reachable(),
-    reason=f"Redis at {REDIS_URL} unreachable — local run without redis; "
-    "CI provides a redis service container via REDIS_URL",
-)
-
 
 # --- App / queue configuration (no Redis needed) ---------------------------
 
@@ -80,69 +57,6 @@ def test_compute_queue_is_default_scope_queue_routed() -> None:
 
 
 # --- Round-trip through real Redis (skipped when Redis is unreachable) ------
-
-
-@pytest.fixture(scope="module")
-def celery_worker() -> Iterator[subprocess.Popen[str]]:
-    """Start a real Celery worker subprocess consuming the Compute queue.
-
-    ``--pool=solo`` keeps it to one process; ``-Q compute`` mirrors how the
-    demo Job is routed (the Compute queue is the default queue). Only used
-    by tests already skipped when Redis is unreachable; the guard below is
-    a second line of defense.
-    """
-    if not _redis_reachable():
-        pytest.skip(f"Redis at {REDIS_URL} unreachable")
-    env = os.environ.copy()
-    env["REDIS_URL"] = REDIS_URL
-    env.setdefault("C_FORCE_ROOT", "1")  # harmless when not root
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "celery",
-            "-A",
-            "seestar_mcp.jobs:app",
-            "worker",
-            "--pool=solo",
-            "-Q",
-            COMPUTE_QUEUE,
-            "-n",
-            f"test-{COMPUTE_QUEUE}@%h",
-            "--loglevel=INFO",
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-    )
-    lines: list[str] = []
-
-    def _pump() -> None:
-        assert proc.stdout is not None
-        lines.extend(proc.stdout)
-
-    threading.Thread(target=_pump, daemon=True).start()
-
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if any("ready." in line for line in lines):
-            break
-        if proc.poll() is not None:
-            pytest.fail("celery worker exited early:\n" + "".join(lines))
-        time.sleep(0.2)
-    else:
-        proc.kill()
-        pytest.fail("celery worker did not become ready:\n" + "".join(lines))
-
-    yield proc
-
-    proc.terminate()
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
 
 
 @requires_redis

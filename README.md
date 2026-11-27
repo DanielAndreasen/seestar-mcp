@@ -57,6 +57,26 @@ image is built from the repo's parent directory so it can copy both
 the host via `uv run` over stdio. `tests/test_jobs.py` round-trips a demo
 `echo` Job through real Redis (skipped locally when Redis is unreachable).
 
+### Idempotency keys, retries, and the Job Tools
+
+- **Idempotency key = Celery task id.** `seestar_mcp.jobs.submit_job(key,
+  task_name, args, kwargs, queue)` submits a Job with `task_id=key` and
+  returns `key`. The key is claimed atomically in Redis (`SET NX EX`, TTL 24h)
+  before sending, so **resubmitting the same key returns the same Job without
+  re-executing it** (Celery itself does not deduplicate by task id).
+- **Retries.** Every Job runs on the `JobTask` base: raising
+  `TransientJobError` triggers autoretry with exponential backoff
+  (`2**retries` seconds, full jitter, capped at 10 min, max 5 retries), after
+  which the Job ends in FAILURE with the exception as error info. Job results
+  expire from Redis after 24h.
+- **Tools.** `job_status(idempotency_key)` returns the Job's state
+  (PENDING / RUNNING / SUCCESS / FAILURE, plus `error` on failure) via
+  `AsyncResult`; `job_result(idempotency_key)` returns the Job's payload on
+  SUCCESS (small, JSON-serializable by contract — FITS stay on disk in the
+  Project) and a small status dict otherwise. Both live in
+  `src/seestar_mcp/tools/jobs.py`; `tests/test_job_tools.py` drives them over
+  real MCP stdio against real Redis.
+
 ## Open questions
 
 - Import seestar-controller as a library vs. subprocess its CLI — decide when
